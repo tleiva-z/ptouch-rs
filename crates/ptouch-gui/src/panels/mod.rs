@@ -3,6 +3,7 @@
 
 //! UI panel modules for the P-Touch GUI.
 
+pub mod cables;
 pub mod canvas;
 pub mod properties;
 pub mod sidebar;

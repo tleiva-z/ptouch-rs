@@ -26,6 +26,7 @@ use ptouch_core::tape;
 use ptouch_core::transport::PtouchDevice;
 
 use ptouch_render::bitmap::LabelBitmap;
+use ptouch_render::cable::{self, CableStyle};
 use ptouch_render::document::{self, LabelDocument};
 use ptouch_render::image_loader;
 use ptouch_render::raster;
@@ -57,6 +58,8 @@ enum Commands {
     BluetoothList,
     /// Launch GUI mode
     Gui,
+    /// Etiquetas de cable: bandera o envolvente
+    Cable(CableArgs),
 }
 
 #[derive(clap::Args)]
@@ -161,6 +164,103 @@ struct PrintArgs {
     /// Printer timeout in seconds
     #[arg(long, default_value = "1")]
     timeout: u32,
+
+    /// Enable debug output
+    #[arg(long)]
+    debug: bool,
+}
+
+#[derive(clap::Args)]
+struct CableArgs {
+    #[command(subcommand)]
+    action: CableAction,
+}
+
+#[derive(Subcommand)]
+enum CableAction {
+    /// Etiqueta bandera: texto, hueco del cable y el mismo texto girado 180°
+    Flag(CableLabelArgs),
+    /// Etiqueta envolvente: el largo alcanza para dar la vuelta al cable
+    Wrap(CableLabelArgs),
+}
+
+#[derive(clap::Args)]
+struct CableLabelArgs {
+    /// Diámetro del cable en milímetros
+    #[arg(long, default_value_t = 6.0)]
+    diameter: f64,
+
+    /// Holgura extra del hueco, en milímetros (bandera)
+    #[arg(long, default_value_t = 2.0)]
+    slack: f64,
+
+    /// Solape extra, en milímetros (envolvente)
+    #[arg(long, default_value_t = 10.0)]
+    overlap: f64,
+
+    /// Largo fijo Brother: 90 mm en bandera, 39 mm en envolvente
+    #[arg(long)]
+    fixed: bool,
+
+    /// Un texto por etiqueta. `|` separa hasta 3 líneas. Se puede repetir.
+    #[arg(long = "text")]
+    text: Vec<String>,
+
+    /// Alto en píxeles de cada línea, en orden. Sin esto, se reparten la cinta.
+    #[arg(long = "height", value_name = "PX")]
+    height: Vec<u32>,
+
+    /// Texto fijo que se repite en la serie. Se usa junto con --prefix.
+    #[arg(long = "line")]
+    line: Vec<String>,
+
+    /// Línea (1 a 3) donde va el número de la serie. 0, el valor por defecto, es la última.
+    #[arg(long, default_value_t = 0)]
+    id_line: u32,
+
+    /// Prefijo de una serie numerada, por ejemplo CBL-
+    #[arg(long)]
+    prefix: Option<String>,
+
+    /// Primer número de la serie
+    #[arg(long, default_value_t = 1)]
+    from: u32,
+
+    /// Cantidad de etiquetas de la serie
+    #[arg(long, default_value_t = 1)]
+    count: u32,
+
+    /// Ceros a la izquierda. 0 no rellena.
+    #[arg(long, default_value_t = 3)]
+    digits: u32,
+
+    /// Tabla: cada fila es una etiqueta y cada columna una línea. CSV, TSV o .xlsx.
+    #[arg(long, value_name = "FILE")]
+    csv: Option<String>,
+
+    /// La primera fila de --csv es encabezado y no se imprime.
+    #[arg(long)]
+    header: bool,
+
+    /// Guardar un PNG en vez de imprimir
+    #[arg(short = 'o', long)]
+    output: Option<String>,
+
+    /// Ancho de cinta en milímetros. Bandera: 12. Envolvente: 18 o 24.
+    #[arg(long, default_value_t = 12)]
+    tape_mm: u8,
+
+    /// Fuente
+    #[arg(short = 'f', long, default_value = "DejaVuSans")]
+    font: String,
+
+    /// Copias de la tira completa
+    #[arg(long, default_value_t = 1)]
+    copies: u32,
+
+    /// No cortar al final de la tira
+    #[arg(long)]
+    chain: bool,
 
     /// Enable debug output
     #[arg(long)]
@@ -360,6 +460,16 @@ fn main() {
         Commands::Info(args) => {
             init_logging(args.debug);
             if let Err(e) = execute_info(&args) {
+                eprintln!("Error: {}", e);
+                process::exit(1);
+            }
+        }
+        Commands::Cable(args) => {
+            let debug = match &args.action {
+                CableAction::Flag(inner) | CableAction::Wrap(inner) => inner.debug,
+            };
+            init_logging(debug);
+            if let Err(e) = execute_cable(args) {
                 eprintln!("Error: {}", e);
                 process::exit(1);
             }
@@ -1065,6 +1175,245 @@ fn print_to_device(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Subcommand: cable
+// ---------------------------------------------------------------------------
+
+/// Build a flag or wrap strip and save it, or print it as one job.
+fn execute_cable(args: CableArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let label = match &args.action {
+        CableAction::Flag(inner) | CableAction::Wrap(inner) => inner,
+    };
+    let texts = resolve_cable_texts(label)?;
+    let style = cable_style(&args.action, label);
+
+    let (tape_px, dpi, max_px, device) = if label.output.is_some() {
+        let px = tape::tape_pixels(label.tape_mm, cable::DESIGN_DPI)
+            .ok_or_else(|| format!("ancho de cinta desconocido: {} mm", label.tape_mm))?;
+        (u32::from(px), cable::DESIGN_DPI, px, None)
+    } else {
+        let mut dev = CliDevice::open(None)?;
+        dev.init()?;
+        let px = dev
+            .tape_width_px()
+            .ok_or("no se pudo leer el ancho de la cinta")?;
+        let dpi = dev.dpi();
+        let max = dev.raster_width_px();
+        let printer_mm = dev.status().map(|status| status.media_width).unwrap_or(0);
+        if printer_mm > 0 && printer_mm != label.tape_mm {
+            eprintln!(
+                "Aviso: pediste cinta de {} mm y la impresora tiene {} mm; se usa la cinta cargada",
+                label.tape_mm, printer_mm
+            );
+        }
+        (u32::from(px), dpi, max, Some(dev))
+    };
+
+    let mut renderer = TextRenderer::new();
+    let line_heights = if label.height.is_empty() {
+        None
+    } else {
+        Some(label.height.as_slice())
+    };
+    let elements = cable::layout_rendered(
+        &texts,
+        style,
+        dpi,
+        tape_px,
+        &label.font,
+        &mut renderer,
+        line_heights,
+    )?;
+    let bitmap = document::render_elements(&elements, tape_px, &label.font, 0, &mut renderer)?
+        .ok_or("la etiqueta de cable salió vacía")?;
+
+    let length_mm = bitmap.width() as f64 / f64::from(dpi) * 25.4;
+    // compose::cutmark is 9 px wide and sits between labels, not inside them.
+    let cut_px = 9 * (texts.len().saturating_sub(1) as u32);
+    let per_px = bitmap.width().saturating_sub(cut_px) / (texts.len().max(1) as u32);
+    let per_mm = per_px as f64 / f64::from(dpi) * 25.4;
+    if per_mm > 73.0 {
+        eprintln!(
+            "Aviso: cada etiqueta mide cerca de {per_mm:.0} mm (la tira completa, {length_mm:.0} mm). \
+             En la PT-D600 hubo cortes cerca de los 73 mm; si una etiqueta se corta antes, \
+             acorta el texto o no uses el largo fijo de 90 mm."
+        );
+    }
+
+    if let Some(path) = &label.output {
+        bitmap.save(Path::new(path))?;
+        println!(
+            "Guardado en '{path}' ({}x{} px, {length_mm:.1} mm de cinta, {} etiqueta(s))",
+            bitmap.width(),
+            bitmap.height(),
+            texts.len()
+        );
+        return Ok(());
+    }
+
+    let Some(mut dev) = device else {
+        return Err("indica --output o conecta la impresora".into());
+    };
+    let lines = raster::bitmap_to_raster_lines(&bitmap, max_px);
+    let copies = label.copies.max(1);
+    for copy in 0..copies {
+        let is_last = copy + 1 == copies;
+        // Intermediate copies stay chained. The last copy cuts unless asked not to.
+        let chain = label.chain || !is_last;
+        dev.print_raster(&lines, chain, false, PrintQuality::Standard)?;
+    }
+    println!(
+        "Impresas {copies} copias ({length_mm:.1} mm de cinta cada una, {} etiqueta(s))",
+        texts.len()
+    );
+    dev.close()?;
+    Ok(())
+}
+
+fn cable_style(action: &CableAction, label: &CableLabelArgs) -> CableStyle {
+    match action {
+        CableAction::Flag(_) => CableStyle::Flag {
+            diameter_mm: label.diameter,
+            slack_mm: label.slack,
+            length_mm: label.fixed.then_some(cable::BROTHER_FLAG_MM),
+        },
+        CableAction::Wrap(_) => CableStyle::Wrap {
+            diameter_mm: label.diameter,
+            overlap_mm: label.overlap,
+            length_mm: label.fixed.then_some(cable::BROTHER_WRAP_MM),
+        },
+    }
+}
+
+fn resolve_cable_texts(args: &CableLabelArgs) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let sources = [
+        args.csv.is_some(),
+        args.prefix.is_some(),
+        !args.text.is_empty(),
+    ]
+    .iter()
+    .filter(|on| **on)
+    .count();
+    if sources == 0 {
+        return Err("indica etiquetas con --text, --prefix o --csv".into());
+    }
+    if sources > 1 {
+        return Err("usa solo una fuente: --text, --prefix o --csv".into());
+    }
+    if args.prefix.is_none() && (!args.line.is_empty() || args.id_line != 0) {
+        return Err("--line y --id-line se usan con --prefix".into());
+    }
+    if args.header && args.csv.is_none() {
+        return Err("--header se usa con --csv".into());
+    }
+    if let Some(path) = &args.csv {
+        let labels = read_cable_table(path, args.header)?;
+        if labels.is_empty() {
+            return Err(format!("'{path}' no tiene etiquetas").into());
+        }
+        return Ok(labels);
+    }
+    if let Some(prefix) = &args.prefix {
+        if args.count == 0 {
+            return Err("--count debe ser mayor que 0".into());
+        }
+        return series_labels(args, prefix);
+    }
+    Ok(args.text.clone())
+}
+
+fn series_labels(
+    args: &CableLabelArgs,
+    prefix: &str,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let ids = cable::expand_ids(prefix, args.from, args.count, args.digits);
+    if args.line.is_empty() {
+        if args.height.len() > 1 {
+            return Err(
+                "la serie tiene una línea; pasa --line para las otras o un solo --height".into(),
+            );
+        }
+        return Ok(ids);
+    }
+    let line_count = args.line.len() + 1;
+    if line_count > cable::MAX_CABLE_LINES {
+        return Err(format!(
+            "una etiqueta admite como máximo {} líneas",
+            cable::MAX_CABLE_LINES
+        )
+        .into());
+    }
+    let id_at = if args.id_line == 0 {
+        line_count - 1
+    } else {
+        args.id_line as usize - 1
+    };
+    if id_at >= line_count {
+        return Err(format!("--id-line debe estar entre 1 y {line_count}").into());
+    }
+    Ok(ids
+        .into_iter()
+        .map(|id| {
+            let mut fixed = args.line.iter();
+            (0..line_count)
+                .map(|index| {
+                    if index == id_at {
+                        id.clone()
+                    } else {
+                        fixed.next().map(String::as_str).unwrap_or("").to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("|")
+        })
+        .collect())
+}
+
+fn read_cable_table(path: &str, header: bool) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if ext == "xlsx" {
+        let rows = xlsx_rows(path)?;
+        return Ok(cable::labels_from_table(&rows, header)?);
+    }
+    let mut file = File::open(path)?;
+    let mut text = String::new();
+    file.read_to_string(&mut text)?;
+    Ok(cable::parse_label_table(&text, header)?)
+}
+
+fn xlsx_rows(path: &str) -> Result<Vec<Vec<String>>, Box<dyn std::error::Error>> {
+    use calamine::Reader;
+
+    let mut workbook = calamine::open_workbook_auto(path)?;
+    let sheet = workbook
+        .sheet_names()
+        .into_iter()
+        .next()
+        .ok_or("el archivo no tiene hojas")?;
+    let range = workbook.worksheet_range(&sheet)?;
+    Ok(range
+        .rows()
+        .map(|row| row.iter().map(cell_text).collect())
+        .collect())
+}
+
+fn cell_text(cell: &calamine::Data) -> String {
+    match cell {
+        calamine::Data::Empty => String::new(),
+        calamine::Data::String(text) => text.clone(),
+        calamine::Data::Float(value) => cable::format_sheet_number(*value),
+        calamine::Data::Int(value) => value.to_string(),
+        calamine::Data::Bool(value) => value.to_string(),
+        calamine::Data::DateTimeIso(text) | calamine::Data::DurationIso(text) => text.clone(),
+        calamine::Data::DateTime(value) => value.to_string(),
+        calamine::Data::Error(_) => String::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1217,5 +1566,98 @@ mod tests {
     #[test]
     fn test_output_n_token_replacement() {
         assert_eq!("label-{n}.png".replace("{n}", "3"), "label-3.png");
+    }
+
+    #[test]
+    fn cable_flag_sequence_parses() {
+        let cli = Cli::try_parse_from([
+            "ptouch",
+            "cable",
+            "flag",
+            "--diameter",
+            "6",
+            "--prefix",
+            "CBL-",
+            "--from",
+            "1",
+            "--count",
+            "3",
+            "-o",
+            "out.png",
+        ])
+        .unwrap();
+        let Commands::Cable(cable) = cli.command else {
+            panic!("expected cable command");
+        };
+        let CableAction::Flag(flag) = cable.action else {
+            panic!("expected flag");
+        };
+        assert_eq!(flag.diameter, 6.0);
+        assert_eq!(flag.prefix.as_deref(), Some("CBL-"));
+        assert_eq!(flag.count, 3);
+        assert_eq!(flag.output.as_deref(), Some("out.png"));
+        assert_eq!(
+            resolve_cable_texts(&flag).unwrap(),
+            vec!["CBL-001", "CBL-002", "CBL-003"]
+        );
+    }
+
+    #[test]
+    fn cable_series_puts_the_number_on_the_chosen_line() {
+        let cli = Cli::try_parse_from([
+            "ptouch",
+            "cable",
+            "flag",
+            "--prefix",
+            "CBL-",
+            "--count",
+            "2",
+            "--line",
+            "LAN",
+            "--id-line",
+            "2",
+            "--height",
+            "16",
+            "--height",
+            "30",
+        ])
+        .unwrap();
+        let Commands::Cable(cable) = cli.command else {
+            panic!("expected cable command");
+        };
+        let CableAction::Flag(flag) = cable.action else {
+            panic!("expected flag");
+        };
+        assert_eq!(flag.height, vec![16, 30]);
+        assert_eq!(
+            resolve_cable_texts(&flag).unwrap(),
+            vec!["LAN|CBL-001", "LAN|CBL-002"]
+        );
+    }
+
+    #[test]
+    fn cable_csv_header_uses_columns_as_lines() {
+        let path = std::env::temp_dir().join(format!("ptouch-table-{}.csv", std::process::id()));
+        std::fs::write(&path, "nombre0,addr\nB1-PR-AF,ADDR: 1\nB1-PR-DV,ADDR: 2\n").unwrap();
+        let cli = Cli::try_parse_from([
+            "ptouch",
+            "cable",
+            "flag",
+            "--csv",
+            path.to_str().unwrap(),
+            "--header",
+        ])
+        .unwrap();
+        let Commands::Cable(cable) = cli.command else {
+            panic!("expected cable command");
+        };
+        let CableAction::Flag(flag) = cable.action else {
+            panic!("expected flag");
+        };
+        assert_eq!(
+            resolve_cable_texts(&flag).unwrap(),
+            vec!["B1-PR-AF|ADDR: 1", "B1-PR-DV|ADDR: 2"]
+        );
+        std::fs::remove_file(path).ok();
     }
 }

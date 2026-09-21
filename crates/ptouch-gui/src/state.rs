@@ -10,6 +10,82 @@ use ptouch_render::bitmap::LabelBitmap;
 
 pub use ptouch_render::document::LabelElement;
 
+/// Cable label shape selected in the sidebar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CableKind {
+    /// Two readable ends and a blank middle.
+    Flag,
+    /// One block long enough to wrap the cable.
+    Wrap,
+}
+
+/// Where the cable labels come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CableSource {
+    /// One label per line. `|` separates lines of the same label.
+    List,
+    /// A numbered series.
+    Sequence,
+    /// A pasted or imported table. Each row is a label and each column a line.
+    Table,
+}
+
+/// Inputs for the cable-label generator.
+pub struct CableForm {
+    pub kind: CableKind,
+    pub diameter_mm: f64,
+    pub slack_mm: f64,
+    pub overlap_mm: f64,
+    /// Use the Brother preset length (flag 90 mm, wrap 39 mm).
+    pub fixed_length: bool,
+    /// One label per line. `|` separates lines of the same label.
+    pub list: String,
+    pub source: CableSource,
+    /// Pasted table text. Tabs, semicolons, or commas separate columns.
+    pub table: String,
+    /// Drop the first non-empty row of `table`.
+    pub table_header: bool,
+    pub prefix: String,
+    pub from: u32,
+    pub count: u32,
+    pub digits: u32,
+    /// How many text lines each label has, from 1 to 3.
+    pub line_count: u8,
+    /// Share the tape height across lines. Otherwise use `line_heights`.
+    pub same_size: bool,
+    /// Pixel height of each line when `same_size` is false.
+    pub line_heights: [u32; 3],
+    /// Which line receives the series number. Ignored outside sequence mode.
+    pub id_line: u8,
+    /// Fixed text for the lines that are not the series number.
+    pub fixed_lines: [String; 3],
+}
+
+impl Default for CableForm {
+    fn default() -> Self {
+        Self {
+            kind: CableKind::Flag,
+            diameter_mm: 6.0,
+            slack_mm: 2.0,
+            overlap_mm: 10.0,
+            fixed_length: false,
+            list: "CBL-001".to_string(),
+            source: CableSource::List,
+            table: String::new(),
+            table_header: true,
+            prefix: "CBL-".to_string(),
+            from: 1,
+            count: 3,
+            digits: 3,
+            line_count: 1,
+            same_size: true,
+            line_heights: [16, 30, 20],
+            id_line: 0,
+            fixed_lines: [String::new(), String::new(), String::new()],
+        }
+    }
+}
+
 /// Printer connection selected in the GUI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrinterTarget {
@@ -151,6 +227,8 @@ pub struct AppState {
     pub print_quality: PrintQuality,
     /// Channel sender for commands to the printer worker thread.
     pub printer_cmd_tx: Option<mpsc::Sender<PrinterCommand>>,
+    /// Cable flag / wrap generator.
+    pub cable: CableForm,
 }
 
 impl Default for AppState {
@@ -186,6 +264,7 @@ impl Default for AppState {
             printer_quality_modes: false,
             print_quality: PrintQuality::Standard,
             printer_cmd_tx: None,
+            cable: CableForm::default(),
         }
     }
 }

@@ -190,8 +190,30 @@
               pkgs.rust-analyzer
             ];
             buildInputs = buildDeps ++ guiRuntimeLibs;
-            # Lets `cargo run -p ptouch-gui` find the dlopened GUI libraries
+            # Lets `cargo run -p ptouch-gui` find the dlopened GUI libraries.
             env.LD_LIBRARY_PATH = lib.makeLibraryPath guiRuntimeLibs;
+            # Nix's libglvnd does not see the host Mesa/NVIDIA driver, so glutin
+            # rejects the Wayland display ("provided display handle is not
+            # supported"). Put the host libEGL directory first. Nix's libpcre2
+            # stays ahead of that directory so grep keeps its own library.
+            shellHook = ''
+              host_gl=""
+              for dir in /usr/lib/x86_64-linux-gnu /usr/lib/aarch64-linux-gnu /usr/lib64 /usr/lib /run/opengl-driver/lib; do
+                if [ -e "$dir/libEGL.so.1" ]; then
+                  host_gl="$dir"
+                  break
+                fi
+              done
+              if [ -n "$host_gl" ]; then
+                pcre_lib=$(ldd "$(command -v grep)" 2>/dev/null | awk '/libpcre2-8.so/ { print $3; exit }')
+                pcre_dir=$(dirname "$pcre_lib" 2>/dev/null || true)
+                if [ -n "$pcre_dir" ] && [ -e "$pcre_dir/libpcre2-8.so.0" ]; then
+                  export LD_LIBRARY_PATH="$pcre_dir:$host_gl''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+                else
+                  export LD_LIBRARY_PATH="$host_gl''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+                fi
+              fi
+            '';
           };
 
           formatter = pkgs.nixfmt;

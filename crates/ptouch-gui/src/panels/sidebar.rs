@@ -8,6 +8,7 @@ use log::info;
 use ptouch_core::protocol::PrintQuality;
 use ptouch_core::tape;
 
+use super::cables;
 use crate::state::{AppState, PrinterCommand};
 
 /// Render the left sidebar.
@@ -16,6 +17,8 @@ pub fn show_sidebar(ui: &mut egui::Ui, state: &mut AppState) {
         show_printer_section(ui, state);
         ui.separator();
         show_tape_section(ui, state);
+        ui.separator();
+        cables::show_cables(ui, state);
         ui.separator();
         show_print_options(ui, state);
         ui.separator();

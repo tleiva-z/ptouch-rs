@@ -79,6 +79,11 @@ pub fn show_properties(ui: &mut egui::Ui, state: &mut AppState) {
             ui.add_space(4.0);
             ui.label("No editable properties.");
         }
+        LabelElement::FoldMark => {
+            ui.label("Mitad");
+            ui.add_space(4.0);
+            ui.label("Línea punteada en el centro de la bandera.");
+        }
         LabelElement::Padding { pixels } => {
             changed |= show_padding_properties(ui, pixels);
         }

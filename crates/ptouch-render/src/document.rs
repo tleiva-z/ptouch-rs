@@ -230,6 +230,9 @@ pub enum LabelElement {
     },
     /// A cut mark separator.
     CutMark,
+    /// A one-pixel dotted line across the tape. Used as the fold guide in the
+    /// middle of a cable flag.
+    FoldMark,
     /// Horizontal padding in pixels.
     Padding {
         /// Padding width in pixels.
@@ -284,6 +287,7 @@ impl LabelElement {
                 format!("Image: {}", name)
             }
             LabelElement::CutMark => "Cut Mark".to_string(),
+            LabelElement::FoldMark => "Mitad".to_string(),
             LabelElement::Padding { pixels } => format!("Padding: {} px", pixels),
         }
     }
@@ -355,6 +359,7 @@ pub fn render_elements(
                 None => continue,
             },
             LabelElement::CutMark => compose::cutmark(tape_width_px),
+            LabelElement::FoldMark => compose::fold_mark(tape_width_px),
             LabelElement::Padding { pixels } => compose::padding(tape_width_px, *pixels),
         };
 
@@ -684,6 +689,25 @@ mod tests {
         assert_eq!(bmp.height(), 64);
         // Padding (10) followed by the 9-pixel cut mark.
         assert_eq!(bmp.width(), 19);
+    }
+
+    #[test]
+    fn test_fold_mark_renders_in_the_middle_of_the_gap() {
+        let mut renderer = TextRenderer::new();
+        let elements = vec![
+            LabelElement::Padding { pixels: 4 },
+            LabelElement::FoldMark,
+            LabelElement::Padding { pixels: 4 },
+        ];
+        let bmp = render_elements(&elements, 8, "", 0, &mut renderer)
+            .unwrap()
+            .unwrap();
+        assert_eq!(bmp.width(), 9);
+        assert!(bmp.get_pixel(4, 0));
+        assert!(bmp.get_pixel(4, 1));
+        assert!(!bmp.get_pixel(4, 2));
+        assert!(!bmp.get_pixel(3, 0));
+        assert!(!bmp.get_pixel(5, 0));
     }
 
     #[test]

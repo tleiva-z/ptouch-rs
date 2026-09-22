@@ -3,7 +3,8 @@
 
 //! Image composition helpers for label building.
 //!
-//! Provides cut marks, padding, and horizontal concatenation of bitmaps.
+//! Provides cut marks, the flag fold line, padding, and horizontal
+//! concatenation of bitmaps.
 
 use crate::bitmap::LabelBitmap;
 
@@ -29,6 +30,26 @@ pub fn cutmark(print_width: u32) -> LabelBitmap {
         y += 6;
     }
 
+    bmp
+}
+
+/// One-pixel dotted line across the tape, marking the fold of a cable flag.
+///
+/// The pattern is 2 pixels on, 2 pixels off. It is one pixel wide so it can
+/// sit inside the flag gap without changing the label length.
+///
+/// - `print_width`: height of the tape in pixels (bitmap height)
+pub fn fold_mark(print_width: u32) -> LabelBitmap {
+    let mut bmp = LabelBitmap::new(1, print_width);
+    let mut y = 0u32;
+    while y < print_width {
+        for dy in 0..2 {
+            if y + dy < print_width {
+                bmp.set_pixel(0, y + dy, true);
+            }
+        }
+        y += 4;
+    }
     bmp
 }
 
@@ -85,6 +106,20 @@ mod tests {
         assert!(!cm.get_pixel(4, 0));
         assert!(!cm.get_pixel(6, 0));
         assert!(!cm.get_pixel(8, 0));
+    }
+
+    #[test]
+    fn test_fold_mark_is_a_one_pixel_dotted_line() {
+        let mark = fold_mark(10);
+        assert_eq!(mark.width(), 1);
+        assert_eq!(mark.height(), 10);
+        assert!(mark.get_pixel(0, 0));
+        assert!(mark.get_pixel(0, 1));
+        assert!(!mark.get_pixel(0, 2));
+        assert!(!mark.get_pixel(0, 3));
+        assert!(mark.get_pixel(0, 4));
+        assert!(mark.get_pixel(0, 8));
+        assert!(mark.get_pixel(0, 9));
     }
 
     #[test]

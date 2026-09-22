@@ -4,9 +4,10 @@
 //! Cable flag and wrap layouts.
 //!
 //! A flag is two copies of the same text with a blank middle that wraps the
-//! cable. The far copy is rotated 180 degrees so both ends read upright once
-//! the label is folded. A wrap is a single text block long enough to go around
-//! the cable plus an overlap.
+//! cable. A one-pixel dotted line marks the middle of that gap so the fold
+//! lines up with the cable. The far copy is rotated 180 degrees so both ends
+//! read upright once the label is folded. A wrap is a single text block long
+//! enough to go around the cable plus an overlap.
 //!
 //! Layouts are [`LabelElement`] lists, so the existing preview and print path
 //! renders them without a second rasterizer.
@@ -411,7 +412,7 @@ fn split_delimited(text: &str, delimiter: char) -> Result<Vec<Vec<String>>> {
 /// turn keeps that width, so the same value pads both legs. When `total_px` is
 /// `None` the legs are exactly the text. When it is set, each leg is padded so
 /// the label (text + pads + gap) equals that length, unless the text is already
-/// wider than a leg.
+/// wider than a leg. The gap keeps a dotted fold line at its center.
 pub fn flag_elements(
     text: &str,
     text_width_px: u32,
@@ -566,7 +567,7 @@ fn flag_with(
     match total_px {
         None => {
             out.push(with_rotation(block, 0.0));
-            push_pad(&mut out, gap_px);
+            push_flag_gap(&mut out, gap_px);
             out.push(with_rotation(block, 180.0));
         }
         Some(total) => {
@@ -574,7 +575,7 @@ fn flag_with(
             let near = body / 2;
             let far = body - near;
             push_oriented(&mut out, block, 0.0, width, near);
-            push_pad(&mut out, gap_px);
+            push_flag_gap(&mut out, gap_px);
             push_oriented(&mut out, block, 180.0, width, far);
         }
     }
@@ -680,7 +681,7 @@ fn with_rotation(block: &LabelElement, rotation: f32) -> LabelElement {
         | LabelElement::Image {
             rotation: angle, ..
         } => *angle = rotation,
-        LabelElement::CutMark | LabelElement::Padding { .. } => {}
+        LabelElement::CutMark | LabelElement::FoldMark | LabelElement::Padding { .. } => {}
     }
     block
 }
@@ -699,6 +700,21 @@ fn push_pad(out: &mut Vec<LabelElement>, pixels: u32) {
     if pixels > 0 {
         out.push(LabelElement::Padding { pixels });
     }
+}
+
+/// Split the cable gap around a one-pixel fold mark.
+///
+/// The mark replaces one pixel of the gap, so the label stays the same length.
+/// An even gap leaves the extra blank pixel on the far side.
+fn push_flag_gap(out: &mut Vec<LabelElement>, gap_px: u32) {
+    if gap_px == 0 {
+        return;
+    }
+    let left = (gap_px - 1) / 2;
+    let right = gap_px - 1 - left;
+    push_pad(out, left);
+    out.push(LabelElement::FoldMark);
+    push_pad(out, right);
 }
 
 fn text_element(content: &str, rotation: f32) -> LabelElement {
@@ -762,13 +778,17 @@ mod tests {
             &elements[0],
             LabelElement::Text { rotation, .. } if *rotation == 0.0
         ));
+        let (left, right) = flag_gap_pads(&elements);
+        assert_eq!(left + 1 + right, gap);
+        assert_eq!(left, (gap - 1) / 2);
+        assert!(
+            elements
+                .iter()
+                .any(|element| matches!(element, LabelElement::FoldMark))
+        );
         assert!(matches!(
-            &elements[1],
-            LabelElement::Padding { pixels } if *pixels == gap
-        ));
-        assert!(matches!(
-            &elements[2],
-            LabelElement::Text { rotation, content, .. }
+            elements.last(),
+            Some(LabelElement::Text { rotation, content, .. })
                 if *rotation == 180.0 && content == "CBL-1"
         ));
     }
@@ -813,8 +833,13 @@ mod tests {
             .iter()
             .filter(|element| matches!(element, LabelElement::Text { .. }))
             .count();
+        let folds = elements
+            .iter()
+            .filter(|element| matches!(element, LabelElement::FoldMark))
+            .count();
         assert_eq!(texts, 2);
-        assert_eq!(pads + text_width * 2, total);
+        assert_eq!(folds, 1);
+        assert_eq!(pads + text_width * 2 + folds as u32, total);
     }
 
     #[test]
@@ -901,10 +926,18 @@ mod tests {
             LabelElement::Text { content, .. } if content == "LAN\nCBL-001"
         ));
         assert!(matches!(
-            &elements[2],
-            LabelElement::Text { rotation, content, .. }
+            elements.last(),
+            Some(LabelElement::Text { rotation, content, .. })
                 if *rotation == 180.0 && content == "LAN\nCBL-001"
         ));
+    }
+
+    fn flag_gap_pads(elements: &[LabelElement]) -> (u32, u32) {
+        let mut pads = elements.iter().filter_map(|element| match element {
+            LabelElement::Padding { pixels } => Some(*pixels),
+            _ => None,
+        });
+        (pads.next().unwrap_or(0), pads.next().unwrap_or(0))
     }
 
     #[test]

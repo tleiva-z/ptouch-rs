@@ -7,9 +7,9 @@ use std::path::PathBuf;
 
 use log::{error, info};
 
-use ptouch_render::document::LabelDocument;
+use ptouch_render::document::{self, LabelDocument};
 use ptouch_render::raster;
-use ptouch_render::text::TextAlign;
+use ptouch_render::text::{TextAlign, TextRenderer};
 
 use crate::state::{AppState, LabelElement, PrinterCommand};
 
@@ -82,21 +82,34 @@ pub fn show_toolbar(ui: &mut egui::Ui, state: &mut AppState) {
         if ui
             .add_enabled(connected && !busy && has_bitmap, egui::Button::new("Print"))
             .clicked()
-            && let Some(ref bitmap) = state.preview_bitmap
         {
-            let raster_lines = raster::bitmap_to_raster_lines(bitmap, state.printer_max_px);
             let chain_print = !state.auto_cut;
             let auto_cut = state.auto_cut;
-            if let Some(ref tx) = state.printer_cmd_tx {
-                let _ = tx.send(PrinterCommand::Print {
-                    raster_lines,
-                    chain_print,
-                    auto_cut,
-                    quality: state.print_quality,
-                    target: state.printer_target.clone(),
-                });
-                state.operation_in_progress = true;
-                state.status_message = "Printing...".to_string();
+            let cut_between = state.cable.cut_between;
+            match raster_pages(state) {
+                Ok(pages) => {
+                    let count = pages.len();
+                    if let Some(ref tx) = state.printer_cmd_tx {
+                        let _ = tx.send(PrinterCommand::Print {
+                            pages,
+                            chain_print,
+                            auto_cut,
+                            cut_between,
+                            quality: state.print_quality,
+                            target: state.printer_target.clone(),
+                        });
+                        state.operation_in_progress = true;
+                        state.status_message = if count > 1 {
+                            format!("Imprimiendo {count} etiquetas...")
+                        } else {
+                            "Printing...".to_string()
+                        };
+                    }
+                }
+                Err(err) => {
+                    error!("Print render failed: {err}");
+                    state.status_message = err;
+                }
             }
         }
 
@@ -127,6 +140,52 @@ pub fn show_toolbar(ui: &mut egui::Ui, state: &mut AppState) {
             do_open_layout(state);
         }
     });
+}
+
+/// Render the print job.
+///
+/// With automatic cutting, each stretch between cut marks is its own page and
+/// the dashed mark is not printed. Without it, the whole preview is one strip
+/// and the dashed mark stays on the tape.
+fn raster_pages(state: &AppState) -> Result<Vec<Vec<Vec<u8>>>, String> {
+    if !state.cable.cut_between {
+        let bitmap = state
+            .preview_bitmap
+            .as_ref()
+            .ok_or_else(|| "No hay etiquetas para imprimir".to_string())?;
+        return Ok(vec![raster::bitmap_to_raster_lines(
+            bitmap,
+            state.printer_max_px,
+        )]);
+    }
+    let slices = document::split_at_cut_marks(&state.elements);
+    if slices.is_empty() {
+        return Err("No hay etiquetas para imprimir".to_string());
+    }
+    let mut renderer = TextRenderer::new();
+    let mut pages = Vec::with_capacity(slices.len());
+    for elements in slices {
+        let Some(bitmap) = document::render_elements(
+            elements,
+            state.tape_width_px,
+            &state.font_name,
+            state.font_margin,
+            &mut renderer,
+        )
+        .map_err(|err| err.to_string())?
+        else {
+            continue;
+        };
+        let bitmap = bitmap.mirrored(state.overall_flip_h, state.overall_flip_v);
+        pages.push(raster::bitmap_to_raster_lines(
+            &bitmap,
+            state.printer_max_px,
+        ));
+    }
+    if pages.is_empty() {
+        return Err("No hay etiquetas para imprimir".to_string());
+    }
+    Ok(pages)
 }
 
 /// Save the current design to a `.ptl` layout file (TOML with embedded images).

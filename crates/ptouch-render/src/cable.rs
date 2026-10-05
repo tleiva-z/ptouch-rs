@@ -4,10 +4,11 @@
 //! Cable flag and wrap layouts.
 //!
 //! A flag is two copies of the same text with a blank middle that wraps the
-//! cable. A one-pixel dotted line marks the middle of that gap so the fold
-//! lines up with the cable. The far copy is rotated 180 degrees so both ends
-//! read upright once the label is folded. A wrap is a single text block long
-//! enough to go around the cable plus an overlap.
+//! cable. That blank is the cable circumference plus a little slack, so the
+//! text starts outside the cable. A one-pixel dotted line marks the middle of
+//! that gap so the fold lines up with the cable. The far copy is rotated 180
+//! degrees so both ends read upright once the label is folded. A wrap is a
+//! single text block long enough to go around the cable plus an overlap.
 //!
 //! Layouts are [`LabelElement`] lists, so the existing preview and print path
 //! renders them without a second rasterizer.
@@ -23,7 +24,7 @@ use crate::text::{TextAlign, TextRenderer};
 /// Design resolution used by the PT-D600 and the other 180 dpi heads.
 pub const DESIGN_DPI: u16 = 180;
 
-/// Extra blank millimetres added to the cable diameter on a flag.
+/// Extra blank millimetres past the cable circumference on a flag.
 pub const DEFAULT_SLACK_MM: f64 = 2.0;
 
 /// Extra millimetres past the circumference on a wrap label.
@@ -41,7 +42,10 @@ pub const MAX_CABLE_LINES: usize = 3;
 /// How a cable label is shaped along the tape.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CableStyle {
-    /// Two text legs and a center gap of `diameter_mm + slack_mm`.
+    /// Two text legs and a center gap of `π × diameter_mm + slack_mm`.
+    ///
+    /// The gap is the cable circumference plus slack, so both copies of the
+    /// text start outside the cable once the label is folded around it.
     ///
     /// `length_mm` forces the whole label to that length (the Brother flag
     /// preset is 90 mm). `None` sizes the legs to the text.
@@ -72,7 +76,7 @@ impl CableStyle {
                 require_non_negative("slack", slack_mm)?;
                 if let Some(length) = length_mm {
                     require_positive("length", length)?;
-                    let gap = diameter_mm + slack_mm;
+                    let gap = flag_gap_mm(diameter_mm, slack_mm);
                     if gap >= length {
                         return Err(RenderError::Layout(format!(
                             "cable gap {gap:.1} mm does not fit in a {length:.1} mm flag"
@@ -104,9 +108,17 @@ pub fn mm_to_px(mm: f64, dpi: u16) -> u32 {
     (mm * f64::from(dpi) / 25.4).round() as u32
 }
 
+/// Blank millimetres between the two legs of a flag.
+///
+/// `π × diameter` is the tape that wraps the cable. `slack` is extra blank
+/// past that circumference, so the text does not land on the cable.
+pub fn flag_gap_mm(diameter_mm: f64, slack_mm: f64) -> f64 {
+    std::f64::consts::PI * diameter_mm + slack_mm
+}
+
 /// Blank pixels between the two legs of a flag.
 pub fn flag_gap_px(diameter_mm: f64, slack_mm: f64, dpi: u16) -> u32 {
-    mm_to_px(diameter_mm + slack_mm, dpi)
+    mm_to_px(flag_gap_mm(diameter_mm, slack_mm), dpi)
 }
 
 /// Pixels needed to wrap a cable of `diameter_mm` plus `overlap_mm`.
@@ -768,10 +780,12 @@ mod tests {
     }
 
     #[test]
-    fn flag_gap_is_diameter_plus_slack() {
+    fn flag_gap_is_circumference_plus_slack() {
+        let gap_mm = flag_gap_mm(6.0, DEFAULT_SLACK_MM);
+        assert!((gap_mm - (std::f64::consts::PI * 6.0 + 2.0)).abs() < 1e-9);
         let gap = flag_gap_px(6.0, DEFAULT_SLACK_MM, DESIGN_DPI);
-        assert_eq!(gap, mm_to_px(8.0, DESIGN_DPI));
-        assert_eq!(gap, 57);
+        assert_eq!(gap, mm_to_px(gap_mm, DESIGN_DPI));
+        assert!(gap > mm_to_px(6.0, DESIGN_DPI));
 
         let elements = flag_elements("CBL-1", 40, gap, None);
         assert!(matches!(

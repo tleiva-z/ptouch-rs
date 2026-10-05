@@ -37,9 +37,10 @@ pub fn printer_worker(
                 do_poll(&current_target, &resp_tx, &ctx);
             }
             Ok(PrinterCommand::Print {
-                raster_lines,
+                pages,
                 chain_print,
                 auto_cut,
+                cut_between,
                 quality,
                 target,
             }) => {
@@ -48,9 +49,10 @@ pub fn printer_worker(
                     &current_target,
                     &resp_tx,
                     &ctx,
-                    &raster_lines,
+                    &pages,
                     chain_print,
                     auto_cut,
+                    cut_between,
                     quality,
                 );
             }
@@ -175,15 +177,16 @@ fn do_print(
     target: &PrinterTarget,
     tx: &mpsc::Sender<PrinterEvent>,
     ctx: &egui::Context,
-    raster_lines: &[Vec<u8>],
+    pages: &[Vec<Vec<u8>>],
     chain_print: bool,
     auto_cut: bool,
+    cut_between: bool,
     quality: PrintQuality,
 ) {
     let result = match target {
-        PrinterTarget::Usb => print_usb(raster_lines, chain_print, auto_cut, quality),
+        PrinterTarget::Usb => print_usb(pages, chain_print, auto_cut, cut_between, quality),
         #[cfg(any(target_os = "macos", test))]
-        PrinterTarget::Bluetooth { address, .. } => print_bluetooth(address, raster_lines),
+        PrinterTarget::Bluetooth { address, .. } => print_bluetooth(address, pages),
     };
     let response = result
         .map(|()| PrinterResponse::PrintDone)
@@ -196,30 +199,35 @@ fn do_print(
 }
 
 fn print_usb(
-    raster_lines: &[Vec<u8>],
+    pages: &[Vec<Vec<u8>>],
     chain_print: bool,
     auto_cut: bool,
+    cut_between: bool,
     quality: PrintQuality,
 ) -> Result<(), String> {
     let mut dev = PtouchDevice::open_first().map_err(|e| format!("Connect error: {e}"))?;
     dev.init().map_err(|e| format!("Init error: {e}"))?;
+    let page_refs: Vec<&[Vec<u8>]> = pages.iter().map(Vec::as_slice).collect();
     let result = dev
-        .print_raster(raster_lines, chain_print, auto_cut, quality)
+        .print_pages(&page_refs, chain_print, auto_cut, quality, cut_between)
         .map_err(|e| format!("Print error: {e}"));
     let _ = dev.close();
     result
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn print_bluetooth(address: &str, raster_lines: &[Vec<u8>]) -> Result<(), String> {
+fn print_bluetooth(address: &str, pages: &[Vec<Vec<u8>>]) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        let bytes: Vec<u8> = raster_lines.iter().flatten().copied().collect();
-        run_helper(&["print", address], Some(&bytes)).map(|_| ())
+        for page in pages {
+            let bytes: Vec<u8> = page.iter().flatten().copied().collect();
+            run_helper(&["print", address], Some(&bytes))?;
+        }
+        Ok(())
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (address, raster_lines);
+        let _ = (address, pages);
         Err("Bluetooth is available on macOS only".to_string())
     }
 }

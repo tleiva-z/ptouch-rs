@@ -28,6 +28,15 @@ pub(crate) trait Transport {
 /// Default timeout for byte transfers.
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// A long label fills the printer's receive buffer. Bulk OUT then waits while
+/// the printer prints, so a short write timeout aborts the job mid-label.
+const PRINT_TRANSFER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long to wait, after a page that is not the last, for the printer to
+/// say it can take the next label. Phase changes arrive as soon as the page
+/// command is accepted; silence means this model does not notify.
+const NEXT_PAGE_IDLE_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Short timeout for flushing stale input.
 const FLUSH_TIMEOUT: Duration = Duration::from_millis(100);
 
@@ -292,10 +301,29 @@ impl<T: Transport> PrinterSession<T> {
         precut: bool,
         quality: protocol::PrintQuality,
     ) -> Result<()> {
+        self.print_pages(&[lines], chain_print, precut, quality, false)
+    }
+
+    /// Print several labels as separate pages of one job.
+    ///
+    /// `cut_between` ends every page with the eject-and-cut command. A form
+    /// feed between pages does not cut on printers such as the PT-D600, so the
+    /// labels would come out as one strip. Without `cut_between`, only the last
+    /// page ejects and the earlier pages stay chained.
+    pub fn print_pages(
+        &mut self,
+        pages: &[&[Vec<u8>]],
+        chain_print: bool,
+        precut: bool,
+        quality: protocol::PrintQuality,
+        cut_between: bool,
+    ) -> Result<()> {
+        if pages.is_empty() {
+            return Ok(());
+        }
         if !self.initialized {
             return Err(PtouchError::NotInitialized);
         }
-
         if quality != protocol::PrintQuality::Standard
             && !self.profile.flags.contains(DeviceFlags::LEGACY_HIRES)
         {
@@ -304,9 +332,34 @@ impl<T: Transport> PrinterSession<T> {
             ));
         }
 
+        let separate_cuts = cut_between && pages.len() > 1;
+        for (index, lines) in pages.iter().enumerate() {
+            let more_pages = index + 1 < pages.len();
+            if separate_cuts {
+                // 0x1A after every label. The completion read waits until this
+                // cut is underway before the next label is sent.
+                self.print_one_page(lines, false, precut, quality, false)?;
+            } else {
+                self.print_one_page(lines, chain_print, precut, quality, more_pages)?;
+                if more_pages && self.profile.dialect != Dialect::P300Bt {
+                    self.wait_for_next_page()?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn print_one_page(
+        &mut self,
+        lines: &[Vec<u8>],
+        chain_print: bool,
+        precut: bool,
+        quality: protocol::PrintQuality,
+        more_pages: bool,
+    ) -> Result<()> {
         if self.profile.dialect == Dialect::P300Bt {
             let status = self.status.as_ref().ok_or(PtouchError::NotInitialized)?;
-            let job = p300bt::build_print_job(lines, status, chain_print)?;
+            let job = p300bt::build_print_job(lines, status, chain_print || more_pages)?;
             let result = self
                 .send_job(job)
                 .and_then(|_| self.receive_p300bt_completion());
@@ -321,11 +374,16 @@ impl<T: Transport> PrinterSession<T> {
             chain_print,
             precut,
             quality,
+            more_pages,
+            margin_dots: feed_margin_dots(&self.profile),
         };
 
         let job = protocol::build_print_job(lines, self.profile.flags, &opts);
         self.send_job(job)?;
 
+        if more_pages {
+            return Ok(());
+        }
         if self
             .profile
             .flags
@@ -376,10 +434,31 @@ impl<T: Transport> PrinterSession<T> {
 
     fn send_job(&self, job: Vec<Vec<u8>>) -> Result<()> {
         for chunk in job {
-            self.send(&chunk)?;
+            self.transport.send(&chunk, PRINT_TRANSFER_TIMEOUT)?;
         }
 
         Ok(())
+    }
+
+    /// Read the phase change that follows a non-final page.
+    ///
+    /// A model that never notifies must not block the rest of the batch, so
+    /// silence is not a failure. An error status still aborts the job.
+    fn wait_for_next_page(&mut self) -> Result<()> {
+        match receive_print_status_with_timeout(
+            |buf, timeout| self.receive_with_timeout(buf, timeout),
+            NEXT_PAGE_IDLE_TIMEOUT,
+        ) {
+            Ok(status) => {
+                self.status = Some(status);
+                Ok(())
+            }
+            Err(PtouchError::Timeout) => {
+                warn!("Printer did not report readiness for the next label, continuing");
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn wait_until_ready(&mut self) -> Result<()> {
@@ -505,6 +584,15 @@ where
             Err(PtouchError::Timeout) => {}
             Err(error) => return Err(error),
         }
+    }
+}
+
+/// 2 mm of feed, except on the D460BT init sequence which already owns `ESC i d`.
+fn feed_margin_dots(profile: &ModelProfile) -> Option<u16> {
+    if profile.flags.contains(DeviceFlags::D460BT_MAGIC) {
+        None
+    } else {
+        Some(protocol::minimum_feed_margin_dots(profile.dpi))
     }
 }
 
@@ -938,9 +1026,79 @@ mod tests {
         raster.extend([0x80; 16]);
         assert_eq!(
             *session.transport.writes.borrow(),
-            vec![vec![0x1b, 0x69, 0x52, 1], vec![0x5a], raster, vec![0x1a]]
+            vec![
+                vec![0x1b, 0x69, 0x52, 1],
+                vec![0x1b, 0x69, 0x64, 0x0e, 0x00],
+                vec![0x5a],
+                raster,
+                vec![0x1a]
+            ]
         );
     }
+
+    #[test]
+    fn usb_pages_form_feed_between_labels_and_eject_the_last() {
+        let mut session = usb_session(DeviceFlags::NONE);
+        session.init().unwrap();
+        session.transport.writes.borrow_mut().clear();
+        let ready = status_packet(0x06, 0x00);
+        session
+            .transport
+            .reads
+            .borrow_mut()
+            .push_back(ready.to_vec());
+        let first = vec![vec![0x11; 16]];
+        let second = vec![vec![0x22; 16]];
+        session
+            .print_pages(
+                &[&first, &second],
+                false,
+                false,
+                protocol::PrintQuality::Standard,
+                false,
+            )
+            .unwrap();
+        let writes = session.transport.writes.borrow();
+        let form_feed = writes.iter().position(|chunk| chunk == &vec![0x0c]);
+        let eject = writes.iter().rposition(|chunk| chunk == &vec![0x1a]);
+        assert!(form_feed.is_some());
+        assert!(eject.is_some());
+        assert!(form_feed.unwrap() < eject.unwrap());
+        assert_eq!(
+            writes
+                .iter()
+                .filter(|chunk| chunk.as_slice() == [0x1b, 0x69, 0x64, 0x0e, 0x00])
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn usb_pages_cut_between_labels_ejects_every_page() {
+        let mut session = usb_session(DeviceFlags::NONE);
+        session.init().unwrap();
+        session.transport.writes.borrow_mut().clear();
+        session.transport.reads.borrow_mut().clear();
+        let first = vec![vec![0x11; 16]];
+        let second = vec![vec![0x22; 16]];
+        session
+            .print_pages(
+                &[&first, &second],
+                true,
+                false,
+                protocol::PrintQuality::Standard,
+                true,
+            )
+            .unwrap();
+        let writes = session.transport.writes.borrow();
+        let ejects = writes
+            .iter()
+            .filter(|chunk| chunk.as_slice() == [0x1a])
+            .count();
+        assert_eq!(ejects, 2);
+        assert!(writes.iter().all(|chunk| chunk.as_slice() != [0x0c]));
+    }
+
     #[test]
     fn usb_session_query_does_not_reset_or_enable_notifications() {
         let mut session = usb_session(DeviceFlags::AUTO_STATUS_NOTIFICATION);

@@ -230,6 +230,21 @@ impl PtouchDevice {
         self.session
             .print_raster(lines, chain_print, precut, quality)
     }
+    /// Print each slice as its own page.
+    ///
+    /// `cut_between` ejects and cuts after every page. Otherwise only the last
+    /// page is cut, and earlier pages stay on the same strip.
+    pub fn print_pages(
+        &mut self,
+        pages: &[&[Vec<u8>]],
+        chain_print: bool,
+        precut: bool,
+        quality: protocol::PrintQuality,
+        cut_between: bool,
+    ) -> Result<()> {
+        self.session
+            .print_pages(pages, chain_print, precut, quality, cut_between)
+    }
     /// Feed tape forward and cut.
     pub fn feed_and_cut(&mut self) -> Result<()> {
         self.session.feed_and_cut()

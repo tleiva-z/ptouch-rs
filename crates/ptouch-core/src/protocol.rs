@@ -277,6 +277,21 @@ pub struct JobOptions {
     pub precut: bool,
     /// Print quality (only acted on if the device supports it).
     pub quality: PrintQuality,
+    /// This page is not the last one. It ends with a form feed (`0x0C`) so the
+    /// printer can cut and accept the next label instead of holding one long
+    /// strip in its expansion buffer.
+    pub more_pages: bool,
+    /// Leading feed in dots (`ESC i d`). `None` omits the command.
+    pub margin_dots: Option<u16>,
+}
+
+/// Minimum leading feed from the PT-H500/P700/E500 raster reference: 2 mm.
+///
+/// At 180 dpi that is 14 dots. At 360 dpi it is 28 dots. A smaller feed lets
+/// the cutter clip the start of the first label.
+pub fn minimum_feed_margin_dots(dpi: u16) -> u16 {
+    let dots = (f64::from(dpi) * 2.0 / 25.4).round() as u16;
+    dots.max(14)
 }
 
 /// Build the complete command stream for one print job.
@@ -287,7 +302,7 @@ pub struct JobOptions {
 /// internal buffer).
 ///
 /// Sequence: rasterstart -> info -> d460bt_magic -> precut ->
-/// d460bt_chain -> packbits -> raster lines -> finalize
+/// d460bt_chain -> margin -> packbits -> raster lines -> finalize
 ///
 /// The compression select (M) is the last control code before the raster
 /// data, as specified by the Brother raster command references (e.g.
@@ -341,6 +356,11 @@ pub fn build_print_job(lines: &[Vec<u8>], flags: DeviceFlags, opts: &JobOptions)
         job.push(cmd_d460bt_chain());
     }
 
+    // D460BT already uses ESC i d for its own init sequence.
+    if let Some(margin) = opts.margin_dots.filter(|_| !is_d460bt) {
+        job.push(cmd_page_flags(margin));
+    }
+
     if use_packbits {
         job.push(cmd_enable_packbits());
     }
@@ -357,7 +377,7 @@ pub fn build_print_job(lines: &[Vec<u8>], flags: DeviceFlags, opts: &JobOptions)
         }
     }
 
-    job.push(cmd_finalize(opts.chain_print, flags));
+    job.push(cmd_finalize(opts.chain_print || opts.more_pages, flags));
 
     job
 }
@@ -514,6 +534,7 @@ mod tests {
             chain_print: false,
             precut: false,
             quality: PrintQuality::Standard,
+            ..JobOptions::default()
         };
         let job = build_print_job(&lines, DeviceFlags::NONE, &opts);
         let expected: Vec<u8> = [
@@ -538,6 +559,7 @@ mod tests {
             chain_print: false,
             precut: true,
             quality: PrintQuality::Standard,
+            ..JobOptions::default()
         };
         let job = build_print_job(&lines, flags, &opts);
         let expected: Vec<u8> = [
@@ -564,6 +586,7 @@ mod tests {
             chain_print: false,
             precut: true,
             quality: PrintQuality::Standard,
+            ..JobOptions::default()
         };
         let job = build_print_job(&lines, flags, &opts);
         let m_pos = job.iter().position(|c| c == &vec![0x4D, 0x02]).unwrap();
@@ -578,6 +601,7 @@ mod tests {
             chain_print: true,
             precut: false,
             quality: PrintQuality::Standard,
+            ..JobOptions::default()
         };
         let job = build_print_job(&lines, DeviceFlags::NONE, &opts);
         assert_eq!(job.last().unwrap(), &vec![0x0C]); // form feed, no cut
@@ -591,6 +615,7 @@ mod tests {
             chain_print: false,
             precut: true,
             quality: PrintQuality::Standard,
+            ..JobOptions::default()
         };
         let job = build_print_job(&lines, DeviceFlags::NONE, &opts);
         assert!(!flat(&job).windows(3).any(|w| w == [0x1B, 0x69, 0x4D]));
@@ -607,6 +632,7 @@ mod tests {
             chain_print: true,
             precut: false,
             quality: PrintQuality::Standard,
+            ..JobOptions::default()
         };
         let job = build_print_job(&lines, flags, &opts);
         let expected: Vec<u8> = [
@@ -706,5 +732,35 @@ mod tests {
         assert!(!bytes.windows(3).any(|w| w == [0x1B, 0x69, 0x63]));
         // Lines are not duplicated either.
         assert_eq!(bytes.iter().filter(|&&b| b == 0x47).count(), 1);
+    }
+
+    #[test]
+    fn minimum_feed_margin_is_two_millimetres() {
+        assert_eq!(minimum_feed_margin_dots(180), 14);
+        assert_eq!(minimum_feed_margin_dots(360), 28);
+    }
+
+    #[test]
+    fn margin_stays_ahead_of_raster_and_another_page_does_not_eject() {
+        let lines = vec![vec![0xAA, 0x55]];
+        let flags = DeviceFlags::RASTER_PACKBITS.union(DeviceFlags::HAS_PRECUT);
+        let opts = JobOptions {
+            media_width: 12,
+            precut: true,
+            more_pages: true,
+            margin_dots: Some(14),
+            ..JobOptions::default()
+        };
+        let job = build_print_job(&lines, flags, &opts);
+        let margin_at = job
+            .iter()
+            .position(|chunk| chunk == &vec![0x1B, 0x69, 0x64, 0x0E, 0x00])
+            .expect("margin command");
+        let packbits_at = job
+            .iter()
+            .position(|chunk| chunk == &vec![0x4D, 0x02])
+            .unwrap();
+        assert!(margin_at < packbits_at);
+        assert_eq!(job.last().unwrap(), &vec![0x0C]);
     }
 }

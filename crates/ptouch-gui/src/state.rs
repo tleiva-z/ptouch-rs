@@ -38,6 +38,9 @@ pub struct CableForm {
     pub overlap_mm: f64,
     /// Use the Brother preset length (flag 90 mm, wrap 39 mm).
     pub fixed_length: bool,
+    /// Cut the tape after every cable label. When false, labels stay one strip
+    /// and the dashed mark shows where to cut by hand.
+    pub cut_between: bool,
     /// One label per line. `|` separates lines of the same label.
     pub list: String,
     pub source: CableSource,
@@ -69,6 +72,7 @@ impl Default for CableForm {
             slack_mm: 2.0,
             overlap_mm: 10.0,
             fixed_length: false,
+            cut_between: true,
             list: "CBL-001".to_string(),
             source: CableSource::List,
             table: String::new(),
@@ -121,11 +125,15 @@ pub enum PrinterCommand {
     DiscoverBluetooth,
     /// Poll for a connected printer (query status only, no init).
     Poll(PrinterTarget),
-    /// Print raster data.
+    /// Print one page per entry.
+    ///
+    /// `cut_between` ejects and cuts after every page. Otherwise the pages stay
+    /// one strip and only the end of the job follows `chain_print`.
     Print {
-        raster_lines: Vec<Vec<u8>>,
+        pages: Vec<Vec<Vec<u8>>>,
         chain_print: bool,
         auto_cut: bool,
+        cut_between: bool,
         quality: PrintQuality,
         target: PrinterTarget,
     },

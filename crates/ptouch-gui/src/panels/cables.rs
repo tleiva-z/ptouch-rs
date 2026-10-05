@@ -48,6 +48,10 @@ pub fn show_cables(ui: &mut egui::Ui, state: &mut AppState) {
                         .suffix(" mm"),
                 );
             });
+            let gap_mm = cable::flag_gap_mm(state.cable.diameter_mm, state.cable.slack_mm);
+            ui.label(format!(
+                "Hueco {gap_mm:.1} mm: perímetro del cable más la holgura"
+            ));
         }
         CableKind::Wrap => {
             ui.horizontal(|ui| {
@@ -66,6 +70,15 @@ pub fn show_cables(ui: &mut egui::Ui, state: &mut AppState) {
         &mut state.cable.fixed_length,
         "Largo fijo Brother (bandera 90 mm, envolvente 39 mm)",
     );
+    ui.checkbox(
+        &mut state.cable.cut_between,
+        "Corte automático entre etiquetas",
+    );
+    if state.cable.cut_between {
+        ui.label("Cada etiqueta se corta al salir.");
+    } else {
+        ui.label("Sale una sola tira. La línea punteada marca dónde cortar.");
+    }
 
     ui.horizontal(|ui| {
         ui.selectable_value(&mut state.cable.source, CableSource::List, "Lista");

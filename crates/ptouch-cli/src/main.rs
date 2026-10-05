@@ -190,7 +190,7 @@ struct CableLabelArgs {
     #[arg(long, default_value_t = 6.0)]
     diameter: f64,
 
-    /// Holgura extra del hueco, en milímetros (bandera)
+    /// Holgura extra después del perímetro, en milímetros (bandera)
     #[arg(long, default_value_t = 2.0)]
     slack: f64,
 
@@ -370,10 +370,28 @@ impl CliDevice {
         precut: bool,
         quality: PrintQuality,
     ) -> Result<(), PtouchError> {
+        self.print_pages(&[lines], chain_print, precut, quality, false)
+    }
+
+    fn print_pages(
+        &mut self,
+        pages: &[&[Vec<u8>]],
+        chain_print: bool,
+        precut: bool,
+        quality: PrintQuality,
+        cut_between: bool,
+    ) -> Result<(), PtouchError> {
         match self {
-            Self::Usb(device) => device.print_raster(lines, chain_print, precut, quality),
+            Self::Usb(device) => {
+                device.print_pages(pages, chain_print, precut, quality, cut_between)
+            }
             #[cfg(target_os = "macos")]
-            Self::Bluetooth(device) => device.print_raster(lines),
+            Self::Bluetooth(device) => {
+                for page in pages {
+                    device.print_raster(page)?;
+                }
+                Ok(())
+            }
         }
     }
 
@@ -1254,13 +1272,18 @@ fn execute_cable(args: CableArgs) -> Result<(), Box<dyn std::error::Error>> {
     let Some(mut dev) = device else {
         return Err("indica --output o conecta la impresora".into());
     };
-    let lines = raster::bitmap_to_raster_lines(&bitmap, max_px);
+    let page_bitmaps = cable_page_bitmaps(&elements, tape_px, &label.font, &mut renderer)?;
+    let rasters: Vec<Vec<Vec<u8>>> = page_bitmaps
+        .iter()
+        .map(|page| raster::bitmap_to_raster_lines(page, max_px))
+        .collect();
+    let page_refs: Vec<&[Vec<u8>]> = rasters.iter().map(Vec::as_slice).collect();
     let copies = label.copies.max(1);
     for copy in 0..copies {
         let is_last = copy + 1 == copies;
         // Intermediate copies stay chained. The last copy cuts unless asked not to.
         let chain = label.chain || !is_last;
-        dev.print_raster(&lines, chain, false, PrintQuality::Standard)?;
+        dev.print_pages(&page_refs, chain, false, PrintQuality::Standard, false)?;
     }
     println!(
         "Impresas {copies} copias ({length_mm:.1} mm de cinta cada una, {} etiqueta(s))",
@@ -1268,6 +1291,24 @@ fn execute_cable(args: CableArgs) -> Result<(), Box<dyn std::error::Error>> {
     );
     dev.close()?;
     Ok(())
+}
+
+fn cable_page_bitmaps(
+    elements: &[ptouch_render::document::LabelElement],
+    tape_px: u32,
+    font: &str,
+    renderer: &mut TextRenderer,
+) -> Result<Vec<ptouch_render::bitmap::LabelBitmap>, Box<dyn std::error::Error>> {
+    let mut pages = Vec::new();
+    for slice in document::split_at_cut_marks(elements) {
+        if let Some(bitmap) = document::render_elements(slice, tape_px, font, 0, renderer)? {
+            pages.push(bitmap);
+        }
+    }
+    if pages.is_empty() {
+        return Err("la etiqueta de cable salió vacía".into());
+    }
+    Ok(pages)
 }
 
 fn cable_style(action: &CableAction, label: &CableLabelArgs) -> CableStyle {

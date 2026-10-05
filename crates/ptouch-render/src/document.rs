@@ -301,6 +301,27 @@ struct FontSettings<'a> {
     margin: u32,
 }
 
+/// Split a strip into printer pages at each cut mark.
+///
+/// The cut mark itself is not part of either page. The printer cuts between
+/// pages instead of drawing the dashed line into one long raster.
+pub fn split_at_cut_marks(elements: &[LabelElement]) -> Vec<&[LabelElement]> {
+    let mut pages = Vec::new();
+    let mut start = 0;
+    for (index, element) in elements.iter().enumerate() {
+        if matches!(element, LabelElement::CutMark) {
+            if start < index {
+                pages.push(&elements[start..index]);
+            }
+            start = index + 1;
+        }
+    }
+    if start < elements.len() {
+        pages.push(&elements[start..]);
+    }
+    pages
+}
+
 /// Render an ordered element list into a single label bitmap.
 ///
 /// Elements are rendered to `tape_width_px` tall segments and concatenated left
@@ -519,6 +540,24 @@ fn rotation_aware_font_size(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cut_marks_split_a_strip_into_pages_and_are_not_printed() {
+        let elements = vec![
+            LabelElement::Padding { pixels: 4 },
+            LabelElement::CutMark,
+            LabelElement::Padding { pixels: 8 },
+            LabelElement::CutMark,
+            LabelElement::Padding { pixels: 2 },
+        ];
+        let pages = split_at_cut_marks(&elements);
+        assert_eq!(pages.len(), 3);
+        assert!(pages.iter().all(|page| {
+            page.iter()
+                .all(|element| !matches!(element, LabelElement::CutMark))
+        }));
+        assert!(matches!(pages[1], [LabelElement::Padding { pixels: 8 }]));
+    }
 
     /// Encode a solid black image of the given size as PNG bytes.
     fn png_bytes(w: u32, h: u32) -> Vec<u8> {
